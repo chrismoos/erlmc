@@ -39,6 +39,8 @@
 -include("erlmc.hrl").
 
 -define(TIMEOUT, 60000).
+-define(WATCH_CHECK_INTERVAL, 10000).
+-define(WATCH_WAIT_TIMEOUT, 5000).
 
 %%--------------------------------------------------------------------
 %%% API
@@ -47,14 +49,18 @@ start() -> start([{"localhost", 11211, 1}]).
 start(CacheServers) when is_list(CacheServers) ->
 	random:seed(now()),
 	case proc_lib:start(?MODULE, init, [self(), CacheServers], 5000) of
-		{ok, _Pid} -> ok;
+		{ok, Pid} -> 
+		    start_watcher(CacheServers, Pid),
+		    ok;
 		Error -> Error
 	end.
 	
 start_link() -> start_link([{"localhost", 11211, 1}]).
 start_link(CacheServers) when is_list(CacheServers) ->
 	random:seed(now()),
-	proc_lib:start_link(?MODULE, init, [self(), CacheServers], 5000).
+	{ok, Pid} = proc_lib:start_link(?MODULE, init, [self(), CacheServers], 5000),
+	start_watcher_link(CacheServers, Pid),
+	{ok, Pid}.
 	
 add_server(Host, Port, PoolSize) ->
 	erlang:send(?MODULE, {add_server, Host, Port, PoolSize}),
@@ -206,6 +212,8 @@ init(Parent, CacheServers) ->
 	
 loop() ->
 	receive
+	    {ping, From} ->
+	        From ! pong;
 		{add_server, Host, Port, ConnPoolSize} ->
 			add_server_to_continuum(Host, Port),
             [start_connection(Host, Port) || _ <- lists:seq(1, ConnPoolSize)];
@@ -257,6 +265,46 @@ revalidate_connections(Host, Port) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+get_watch_check_interval() ->
+    case application:get_env(erlmc, watch_check_interval) of
+        {ok, Interval} -> Interval;
+        _ -> ?WATCH_CHECK_INTERVAL
+    end.
+    
+get_watch_wait_timeout() ->
+    case application:get_env(erlmc, watch_wait_timeout) of
+        {ok, Timeout} -> Timeout;
+        _ -> ?WATCH_WAIT_TIMEOUT
+    end.
+
+restart_erlmc(CacheServers, Pid) ->
+    exit(Pid, kill),
+    error_logger:info_msg("Restarting erlmc process...~n", []),
+    start(CacheServers).
+
+watch(CacheServers, Pid, Interval, Timeout) ->
+    timer:sleep(Interval),
+    Pid ! {ping, self()},
+    receive
+        pong -> watch(CacheServers, Pid, Interval, Timeout);
+        Other -> 
+            error_logger:error_msg("Unknown ping response received from erlmc: ~p~n", [Other]),
+            restart_erlmc(CacheServers, Pid)
+    after Timeout ->
+        error_logger:error_msg("Timeout while pinging erlmc process (~p ms)~n", [Timeout]),
+        restart_erlmc(CacheServers, Pid)
+    end.            
+
+start_watcher(CacheServers, Pid) ->
+    spawn(fun() ->
+        watch(CacheServers, Pid, get_watch_check_interval(), get_watch_wait_timeout())
+    end).
+    
+start_watcher_link(CacheServers, Pid) ->
+    spawn_link(fun() ->
+        watch(CacheServers, Pid, get_watch_check_interval(), get_watch_wait_timeout())
+    end).
+
 add_server_to_continuum(Host, Port) ->
 	[ets:insert(erlmc_continuum, {hash_to_uint(Host ++ integer_to_list(Port) ++ integer_to_list(I)), {Host, Port}}) || I <- lists:seq(1, 100)].
 
